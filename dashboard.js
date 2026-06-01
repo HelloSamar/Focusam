@@ -21,12 +21,52 @@ function updateWithState(res) {
 }
 
 // initial fetch
-chrome.runtime.sendMessage({ type: "getFocusState" }, res => updateWithState(res));
+chrome.runtime.sendMessage({ type: "getFocusState" }, res => {
+  updateWithState(res);
+  // if active, start ticking UI
+  if (res && res.focusActive) startTicker();
+});
 
-// listen for storage changes to update UI (avoids tight polling)
+let _tickerId = null;
+function startTicker() {
+  if (_tickerId) return;
+  // update every second while visible
+  _tickerId = setInterval(() => {
+    chrome.runtime.sendMessage({ type: "getFocusState" }, res => updateWithState(res));
+  }, 1000);
+}
+
+function stopTicker() {
+  if (_tickerId) {
+    clearInterval(_tickerId);
+    _tickerId = null;
+  }
+}
+
+// listen for storage changes to update UI and start/stop ticker
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.focusEndTime || changes.focusActive || changes.sessionsToday) {
-    chrome.runtime.sendMessage({ type: "getFocusState" }, res => updateWithState(res));
+    chrome.runtime.sendMessage({ type: "getFocusState" }, res => {
+      updateWithState(res);
+      if (res && res.focusActive) {
+        // start ticking only when visible
+        if (!document.hidden) startTicker();
+      } else {
+        stopTicker();
+      }
+    });
+  }
+});
+
+// pause ticker when tab becomes hidden, resume when visible (avoids wasted work)
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    stopTicker();
+  } else {
+    // fetch current state and decide
+    chrome.runtime.sendMessage({ type: "getFocusState" }, res => {
+      if (res && res.focusActive) startTicker();
+    });
   }
 });
