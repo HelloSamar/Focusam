@@ -14,12 +14,20 @@ function normalizeDomain(url) {
   }
 }
 
+// Storage helpers for consistent async/await usage
+function getStorage(keys) {
+  return new Promise(resolve => chrome.storage.local.get(keys, resolve));
+}
+function setStorage(obj) {
+  return new Promise(resolve => chrome.storage.local.set(obj, resolve));
+}
+
 function completeFocus() {
   focusTimer = null;
   focusEndTime = null;
   sessionsToday++;
 
-  chrome.storage.local.set({
+  setStorage({
     focusActive: false,
     focusEndTime: null,
     sessionsToday
@@ -29,7 +37,7 @@ function completeFocus() {
     type: "basic",
     iconUrl: "icon.png",
     title: "Focus Complete",
-    message: "30 minutes completed."
+    message: `${FOCUS_MINUTES} minutes completed.`
   });
 }
 
@@ -43,7 +51,7 @@ function startFocusTimer() {
 
   focusEndTime = Date.now() + FOCUS_MINUTES * 60 * 1000;
 
-  chrome.storage.local.set({
+  setStorage({
     focusActive: true,
     focusEndTime,
     sessionsToday
@@ -53,7 +61,7 @@ function startFocusTimer() {
     type: "basic",
     iconUrl: "icon.png",
     title: "Focus Started",
-    message: "Focus on your SSC CGL 2026."
+    message: "Focus started."
   });
 
   if (focusTimer) clearTimeout(focusTimer);
@@ -68,14 +76,14 @@ function stopFocusTimer() {
 
   focusEndTime = null;
 
-  chrome.storage.local.set({
+  setStorage({
     focusActive: false,
     focusEndTime: null
   });
 }
 
 function buildRules(blocklist, keywords) {
-  const domainRules = blocklist.map((domain, i) => ({
+  const domainRules = (blocklist || []).map((domain, i) => ({
     id: i + 1,
     priority: 1,
     action: {
@@ -88,7 +96,7 @@ function buildRules(blocklist, keywords) {
     }
   }));
 
-  const keywordRules = keywords.map((word, i) => ({
+  const keywordRules = (keywords || []).map((word, i) => ({
     id: 1000 + i + 1,
     priority: 1,
     action: {
@@ -105,13 +113,11 @@ function buildRules(blocklist, keywords) {
 }
 
 async function applyRules() {
-  const { blocklist = [], keywords = [] } =
-    await chrome.storage.local.get(["blocklist", "keywords"]);
-
+  const { blocklist = [], keywords = [] } = await getStorage(["blocklist", "keywords"]);
   const newRules = buildRules(blocklist, keywords);
 
   const oldRules = await chrome.declarativeNetRequest.getDynamicRules();
-  const oldIds = oldRules.map(r => r.id);
+  const oldIds = (oldRules || []).map(r => r.id);
 
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: oldIds,
@@ -125,14 +131,22 @@ chrome.runtime.onStartup.addListener(applyRules);
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "addCurrentSite") {
     chrome.tabs.query({ active: true, currentWindow: true }, async tabs => {
-      const domain = normalizeDomain(tabs[0].url);
-      if (!domain) return;
+      if (!tabs || !tabs[0] || !tabs[0].url) {
+        sendResponse({ ok: false, error: "Unable to get active tab URL" });
+        return;
+      }
 
-      const { blocklist = [] } = await chrome.storage.local.get(["blocklist"]);
+      const domain = normalizeDomain(tabs[0].url);
+      if (!domain) {
+        sendResponse({ ok: false, error: "Invalid URL" });
+        return;
+      }
+
+      const { blocklist = [] } = await getStorage(["blocklist"]);
 
       if (!blocklist.includes(domain)) {
         blocklist.push(domain);
-        await chrome.storage.local.set({ blocklist });
+        await setStorage({ blocklist });
         await applyRules();
       }
 
@@ -146,7 +160,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "stopFocus") stopFocusTimer();
 
   if (msg.type === "getBlocklist") {
-    chrome.storage.local.get(["blocklist"]).then(data => {
+    getStorage(["blocklist"]).then(data => {
       sendResponse({ blocklist: data.blocklist || [] });
     });
     return true;
@@ -157,18 +171,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "getFocusState") {
-    chrome.storage.local.get(
-      ["focusActive", "focusEndTime", "sessionsToday"],
-      data => sendResponse(data)
-    );
+    getStorage(["focusActive", "focusEndTime", "sessionsToday"]).then(data => sendResponse(data));
     return true;
   }
 });
 
 /* Restore timer after service worker sleeps */
-chrome.storage.local.get(
-  ["focusActive", "focusEndTime", "sessionsToday"],
-  data => {
+(async function restoreTimer() {
+  try {
+    const data = await getStorage(["focusActive", "focusEndTime", "sessionsToday"]);
     if (data.sessionsToday) sessionsToday = data.sessionsToday;
 
     if (data.focusActive && data.focusEndTime) {
@@ -181,5 +192,8 @@ chrome.storage.local.get(
         completeFocus();
       }
     }
+  } catch (e) {
+    // Non-fatal: log to console for debugging during development only
+    // console.error("restoreTimer error", e);
   }
-);
+})();
