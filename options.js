@@ -51,6 +51,20 @@ function checkFocusLock() {
   });
 }
 
+// simple debounce helper
+function debounce(fn, wait = 250) {
+  let t = null;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), wait);
+  };
+}
+
+// Send refreshRules but debounce to avoid spamming background
+const sendRefreshDebounced = debounce(() => {
+  chrome.runtime.sendMessage({ type: "refreshRules" });
+}, 300);
+
 unlockBtn.addEventListener("click", () => {
   chrome.storage.local.get(["password"], data => {
     if (!data.password) {
@@ -87,7 +101,7 @@ saveBtn.addEventListener("click", async () => {
     .filter(Boolean);
 
   await chrome.storage.local.set({ blocklist: domains });
-  chrome.runtime.sendMessage({ type: "refreshRules" });
+  sendRefreshDebounced();
 
   renderLists();
 });
@@ -101,9 +115,16 @@ saveKeywordsBtn.addEventListener("click", async () => {
     .filter(Boolean);
 
   await chrome.storage.local.set({ keywords: words });
-  chrome.runtime.sendMessage({ type: "refreshRules" });
+  sendRefreshDebounced();
 });
 
 renderLists();
 checkFocusLock();
-setInterval(checkFocusLock, 1000);
+
+// react to storage changes instead of polling
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  // if blocklist/keywords or focus state changed, update UI
+  if (changes.blocklist || changes.keywords) renderLists();
+  if (changes.focusActive || changes.focusEndTime || changes.sessionsToday) checkFocusLock();
+});
