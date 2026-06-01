@@ -1,10 +1,15 @@
 const DASHBOARD_URL = chrome.runtime.getURL("dashboard.html");
 const FOCUS_MINUTES = 30;
+const NOTIF_ID = "focus-notif";
+const MAX_BLOCKLIST = 500;
 
-let focusTimer = null;
+let focusTimer = null; // retained for compatibility but we use alarms
 let focusEndTime = null;
 let sessionsToday = 0;
 let todayKey = new Date().toDateString();
+
+let _applyRunning = false;
+let _applyPending = false;
 
 function normalizeDomain(url) {
   try {
@@ -22,7 +27,14 @@ function setStorage(obj) {
   return new Promise(resolve => chrome.storage.local.set(obj, resolve));
 }
 
+function _showNotification(options) {
+  // reuse the same notification id to avoid clutter
+  chrome.notifications.create(NOTIF_ID, options);
+}
+
 function completeFocus() {
+  // Clear any alarm/timer state
+  chrome.alarms.clear("focusComplete");
   focusTimer = null;
   focusEndTime = null;
   sessionsToday++;
@@ -33,7 +45,7 @@ function completeFocus() {
     sessionsToday
   });
 
-  chrome.notifications.create({
+  _showNotification({
     type: "basic",
     iconUrl: "icon.png",
     title: "Focus Complete",
@@ -57,18 +69,22 @@ function startFocusTimer() {
     sessionsToday
   });
 
-  chrome.notifications.create({
+  _showNotification({
     type: "basic",
     iconUrl: "icon.png",
     title: "Focus Started",
     message: "Focus started."
   });
 
-  if (focusTimer) clearTimeout(focusTimer);
-  focusTimer = setTimeout(() => completeFocus(), FOCUS_MINUTES * 60 * 1000);
+  // Use alarms API instead of long-running setTimeout so service worker unloads don't break timers
+  chrome.alarms.clear("focusComplete", () => {
+    chrome.alarms.create("focusComplete", { when: focusEndTime });
+  });
 }
 
 function stopFocusTimer() {
+  // Clear alarm
+  chrome.alarms.clear("focusComplete");
   if (focusTimer) {
     clearTimeout(focusTimer);
     focusTimer = null;
@@ -82,8 +98,20 @@ function stopFocusTimer() {
   });
 }
 
+function _normalizeRuleForCompare(r) {
+  return {
+    id: r.id,
+    priority: r.priority,
+    action: (r.action && r.action.redirect && r.action.redirect.url) || null,
+    condition: {
+      urlFilter: r.condition && r.condition.urlFilter,
+      resourceTypes: r.condition && r.condition.resourceTypes
+    }
+  };
+}
+
 function buildRules(blocklist, keywords) {
-  const domainRules = (blocklist || []).map((domain, i) => ({
+  const domainRules = (blocklist || []).slice(0, MAX_BLOCKLIST).map((domain, i) => ({
     id: i + 1,
     priority: 1,
     action: {
@@ -96,37 +124,86 @@ function buildRules(blocklist, keywords) {
     }
   }));
 
-  const keywordRules = (keywords || []).map((word, i) => ({
-    id: 1000 + i + 1,
-    priority: 1,
-    action: {
-      type: "redirect",
-      redirect: { url: DASHBOARD_URL }
-    },
-    condition: {
-      urlFilter: word,
-      resourceTypes: ["main_frame"]
-    }
-  }));
+  const keywordRules = (keywords || [])
+    .map(w => (w || "").trim())
+    .filter(w => w && w.length > 1)
+    .map((word, i) => ({
+      id: 1000 + i + 1,
+      priority: 1,
+      action: {
+        type: "redirect",
+        redirect: { url: DASHBOARD_URL }
+      },
+      condition: {
+        // keep keywords conservative; ignore trivially short strings
+        urlFilter: word,
+        resourceTypes: ["main_frame"]
+      }
+    }));
 
   return [...domainRules, ...keywordRules];
 }
 
+// Apply rules but avoid redundant updates and coalesce rapid calls
 async function applyRules() {
-  const { blocklist = [], keywords = [] } = await getStorage(["blocklist", "keywords"]);
-  const newRules = buildRules(blocklist, keywords);
+  if (_applyRunning) {
+    _applyPending = true;
+    return;
+  }
 
-  const oldRules = await chrome.declarativeNetRequest.getDynamicRules();
-  const oldIds = (oldRules || []).map(r => r.id);
+  _applyRunning = true;
+  try {
+    const { blocklist = [], keywords = [] } = await getStorage(["blocklist", "keywords"]);
+    const newRules = buildRules(blocklist, keywords);
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: oldIds,
-    addRules: newRules
-  });
+    const oldRules = await chrome.declarativeNetRequest.getDynamicRules();
+
+    // Normalize for comparison
+    const normNew = newRules.map(_normalizeRuleForCompare).sort((a, b) => a.id - b.id);
+    const normOld = (oldRules || []).map(_normalizeRuleForCompare).sort((a, b) => a.id - b.id);
+
+    const newJson = JSON.stringify(normNew);
+    const oldJson = JSON.stringify(normOld);
+
+    if (newJson === oldJson) {
+      // no change, skip update
+      return;
+    }
+
+    const oldIds = (oldRules || []).map(r => r.id);
+
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: oldIds,
+      addRules: newRules
+    });
+  } finally {
+    _applyRunning = false;
+    if (_applyPending) {
+      _applyPending = false;
+      // call again to pick up any changes that happened while running
+      applyRules();
+    }
+  }
 }
 
-chrome.runtime.onInstalled.addListener(applyRules);
-chrome.runtime.onStartup.addListener(applyRules);
+chrome.runtime.onInstalled.addListener(() => applyRules());
+chrome.runtime.onStartup.addListener(() => applyRules());
+
+// Listen for alarms (used for focus completion)
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm && alarm.name === "focusComplete") {
+    // When alarm fires, double-check stored end time
+    getStorage(["focusEndTime"]).then(data => {
+      const end = data.focusEndTime;
+      if (end && end <= Date.now()) {
+        completeFocus();
+      } else if (end) {
+        // if end moved in future, reschedule
+        chrome.alarms.create("focusComplete", { when: end });
+      }
+    });
+  }
+});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "addCurrentSite") {
@@ -146,7 +223,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       if (!blocklist.includes(domain)) {
         blocklist.push(domain);
-        await setStorage({ blocklist });
+        // enforce max size
+        const trimmed = blocklist.slice(0, MAX_BLOCKLIST);
+        await setStorage({ blocklist: trimmed });
         await applyRules();
       }
 
@@ -167,6 +246,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "refreshRules") {
+    // coalesce rapid calls by delegating to applyRules which handles pending
     applyRules();
   }
 
@@ -187,7 +267,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       if (remaining > 0) {
         focusEndTime = data.focusEndTime;
-        focusTimer = setTimeout(() => completeFocus(), remaining);
+        // schedule via alarms for reliability
+        chrome.alarms.clear("focusComplete", () => {
+          chrome.alarms.create("focusComplete", { when: focusEndTime });
+        });
       } else {
         completeFocus();
       }
