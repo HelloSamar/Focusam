@@ -1,7 +1,4 @@
 # Focus Web Blocker Chrome Extension
-
-> **Recommended Repo Name:** `focus-web-blocker` or `ssc-focus-web-blocker`
-
 ---
 
 ## Overview
