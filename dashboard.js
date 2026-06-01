@@ -5,21 +5,28 @@ function formatTime(ms) {
   return `${min}:${sec}`;
 }
 
-function update() {
-  chrome.runtime.sendMessage({ type: "getFocusState" }, res => {
-    const timerEl = document.getElementById("timer");
-    const sessionsEl = document.getElementById("sessions");
+function updateWithState(res) {
+  const timerEl = document.getElementById("timer");
+  const sessionsEl = document.getElementById("sessions");
+  if (!timerEl || !sessionsEl) return;
 
-    sessionsEl.textContent = `Sessions today: ${res.sessionsToday || 0}`;
+  sessionsEl.textContent = `Sessions today: ${res.sessionsToday || 0}`;
 
-    if (res.focusActive && res.focusEndTime) {
-      const remaining = res.focusEndTime - Date.now();
-      timerEl.textContent = formatTime(remaining);
-    } else {
-      timerEl.textContent = "Stay Focused";
-    }
-  });
+  if (res.focusActive && res.focusEndTime) {
+    const remaining = res.focusEndTime - Date.now();
+    timerEl.textContent = formatTime(remaining > 0 ? remaining : 0);
+  } else {
+    timerEl.textContent = "Stay Focused";
+  }
 }
 
-setInterval(update, 1000);
-update();
+// initial fetch
+chrome.runtime.sendMessage({ type: "getFocusState" }, res => updateWithState(res));
+
+// listen for storage changes to update UI (avoids tight polling)
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes.focusEndTime || changes.focusActive || changes.sessionsToday) {
+    chrome.runtime.sendMessage({ type: "getFocusState" }, res => updateWithState(res));
+  }
+});
